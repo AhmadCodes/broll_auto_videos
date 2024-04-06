@@ -1,0 +1,9 @@
+./*
+./*.mp4
+./*.avi
+./*.mkv
+./*.flv
+./*.wmv
+./*.mov
+*
+!.gitignore

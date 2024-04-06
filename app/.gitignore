@@ -1,0 +1,10 @@
+*.png
+*.jpg
+*.jpeg
+*.gif
+./*.pyc
+*/__pycache__/
+__pycache__
+*.pyc
+dreamshaper_lcm/__pycache__
+dreamshaper_lcm/__pycache__/*
