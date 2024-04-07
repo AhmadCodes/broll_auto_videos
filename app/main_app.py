@@ -36,10 +36,8 @@ def get_s3_client():
 
 
 # Set your Pexels API key
-PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
 
 # Create an API object
-pexel_api = Pexels(PEXELS_API_KEY)
 
 # Search for videos with the keyword 'ocean'
 
@@ -183,6 +181,7 @@ def get_chunks_paths(video_path, chunk_size_sec):
 def download_pexels_video(search_phrases,
                           a_roll_start_s,
                           a_roll_end_s,
+                          pexels_api_key,
                           download_dir=os.path.join(
                               os.path.dirname(__file__), "static"),
                           n_searches_per_phrase=3,
@@ -191,8 +190,9 @@ def download_pexels_video(search_phrases,
     err_msg = ""
     downloaded_files = None
     try:
+        pexels_api = Pexels(pexels_api_key)
         for search_phrase in search_phrases:
-            search_results = pexel_api.search_videos(
+            search_results = pexels_api.search_videos(
                 query=search_phrase, orientation='', size='', color='', locale='', page=1, per_page=n_searches_per_phrase)
             search_videos.extend(search_results['videos'])
         if debug:
@@ -510,6 +510,7 @@ class NumpyEncoder(json.JSONEncoder):
 
 def pipeline(word_level_transcript,
              n_vids_hint,
+             pexels_api_key,
              n_searches_per_broll=3,
              openaiapi_key=os.getenv("OPENAI_API_KEY"),
              debug=False
@@ -533,6 +534,7 @@ def pipeline(word_level_transcript,
             video_dict, err_msg = download_pexels_video([broll_description['search_phrase']],
                                                         a_roll_start_s=broll_description['start'],
                                                         a_roll_end_s=broll_description['end'],
+                                                        pexels_api_key=pexels_api_key,
                                                         n_searches_per_phrase=n_searches_per_broll,
                                                         debug=debug)
             if debug:
@@ -573,6 +575,7 @@ if __name__ == "__main__":
                         n_vids_hint=6,
                         n_searches_per_broll=2,
                         openaiapi_key=OPENAI_API_KEY,
+                        pexels_api_key=os.environ.get("PEXELS_API_KEY"),
                         debug=True)
     t1 = time.time()
     print("Time taken: ", t1-t0)
