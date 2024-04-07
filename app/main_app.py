@@ -5,6 +5,7 @@
 
 # change_settings({"IMAGEMAGICK_BINARY": "/usr/bin/convert"})
 
+import cv2
 import traceback as tb
 from pexelsapi.pexels import Pexels
 import uuid
@@ -63,6 +64,47 @@ S3_CLIENT = get_s3_client()
 # %%
 
 
+def chunk_level_transcript(word_level_transcript, chunk_size_s=3):
+    chunked_ts = []
+    start_t = 0
+    started = False
+    end_t = 0
+    chunk = []
+
+    for i in range(0, len(word_level_transcript)):
+        chunk.append(word_level_transcript[i])
+        if not started:
+            start_t = float(word_level_transcript[i]['start'])
+            started = True
+        end_t = float(word_level_transcript[i]['end'])
+        delta = end_t - start_t
+        if delta >= chunk_size_s:
+            chunk_words_str = " ".join([w['word'] for w in chunk])
+            chunk_start = chunk[0]['start']
+            chunk_end = chunk[-1]['end']
+            chunked_ts.append(
+                {"start": chunk_start, "end": chunk_end, "segment": chunk_words_str})
+            started = False
+            chunk = []
+
+    if len(chunk) > 0:
+        chunk_words_str = " ".join([w['word'] for w in chunk])
+        chunk_start = chunk[0]['start']
+        chunk_end = chunk[-1]['end']
+        chunked_ts.append(
+            {"start": chunk_start, "end": chunk_end, "segment": chunk_words_str})
+    return chunked_ts
+
+
+def convert_to_srt(word_level_transcript):
+    srt = ""
+    for i, word in enumerate(word_level_transcript):
+        srt += f"{i + 1}\n"
+        srt += f"{word['start']} --> {word['end']}\n"
+        srt += f"{word['segment']}\n\n"
+    return srt
+
+
 def convert_to_text(word_level_transcript):
     text = " ".join([w['word'] for w in word_level_transcript])
     return text
@@ -86,7 +128,61 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 # %%
 
 
+def get_video_chunks(path,
+                     chunk_size_sec):
+    vid = cv2.VideoCapture(path)
+    fps = vid.get(cv2.CAP_PROP_FPS)
+    total_frames = int(vid.get(cv2.CAP_PROP_FRAME_COUNT))
+    chunk_size = int(chunk_size_sec * fps)
+    chunks = []
+    chunk = []
+    n_chunks = int(total_frames // chunk_size)
+    print(f"Total frames: {total_frames}")
+    print(f"FPS: {fps}")
+    print(f"Chunk size: {chunk_size}")
+
+    while True:
+        ret, frame = vid.read()
+        if not ret:
+            break
+        chunk.append(frame)
+        if len(chunk) == chunk_size:
+            chunks.append(np.array(chunk))
+            chunk = []
+    return chunks, fps, vid.get(cv2.CAP_PROP_FRAME_HEIGHT), vid.get(cv2.CAP_PROP_FRAME_WIDTH)
+
+
+def write_chunks_as_video(chunk, output_path,
+                          fps,
+                          height, width):
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(output_path, fourcc, fps, (int(width), int(height)))
+    # for chunk in chunks:
+    for frame in chunk:
+        out.write(frame)
+    out.release()
+
+
+def get_chunks_paths(video_path, chunk_size_sec):
+
+    chunks, fps, height, width = get_video_chunks(video_path, chunk_size_sec)
+    chunk_paths_dicts = []
+    vid_path_without_ext = video_path.split('.')[0]
+    for i, chunk in enumerate(chunks):
+        start_s = i * chunk_size_sec
+        end_s = (i + 1) * chunk_size_sec
+        chunk_path = f'{vid_path_without_ext}_chunk_{i}.mp4'
+        write_chunks_as_video(chunk, chunk_path, fps, height, width)
+        chunk_paths_dicts.append({"path": chunk_path,
+                                  "start_s": start_s,
+                                  "end_s": end_s})
+
+    return chunk_paths_dicts
+
+
 def download_pexels_video(search_phrases,
+                          a_roll_start_s,
+                          a_roll_end_s,
                           download_dir=os.path.join(
                               os.path.dirname(__file__), "static"),
                           n_searches_per_phrase=3,
@@ -126,9 +222,24 @@ def download_pexels_video(search_phrases,
                 file_name = os.path.join(download_dir, f'{i}.mp4')
                 with open(file_name, 'wb') as file:
                     file.write(response.content)
-                downloaded_files[video_id] = {"local_path": file_name,
-                                              "video_information": video,
-                                              }
+                chunk_size_sec = abs(float(a_roll_end_s) - a_roll_start_s)
+                chunk_path_dicts = get_chunks_paths(file_name,
+                                                    chunk_size_sec=chunk_size_sec)
+                for chunk_path_dict in (chunk_path_dicts):
+                    start_s = chunk_path_dict['start_s']
+                    end_s = chunk_path_dict['end_s']
+                    chunk_size_s = abs(end_s - start_s)
+                    chunk_path = chunk_path_dict['path']
+                    video_id = str(video_id) + "_" + \
+                        str(start_s) + "_" + str(end_s)
+
+                    downloaded_files[video_id] = {"local_path": chunk_path,
+                                                  "b_roll_video_start_s": start_s,
+                                                  "b_roll_video_end_s": end_s,
+                                                  "a_roll_video_insertion_start_s": a_roll_start_s,
+                                                  "a_roll_video_insertion_end_s": a_roll_end_s,
+                                                  "b_roll_video_information": video,
+                                                  }
                 if debug:
                     print(f'Downloaded video: {file_name}')
             else:
@@ -190,20 +301,21 @@ def validate_KV_pair(dict_list,
                      debug=False):
     for d in dict_list:
         check_all_keys = all([k in d.keys()
-                             for k in ['description', "search_phrases"]])
+                             for k in ['description', "search_phrase", "start", "end"]])
 
         check_description = isinstance(d['description'], str)
-        check_keywords = isinstance(d['search_phrases'], list)
-        check_each_keyword = all([isinstance(k, str)
-                                 for k in d['search_phrases']])
+        check_keywords = isinstance(d['search_phrase'], str)
+        check_start = isinstance(d['start'], float)
+        check_end = isinstance(d['end'], float)
 
         if debug:
             print("check_all_keys: ", check_all_keys)
             print("check_description: ", check_description)
             print("check_keywords: ", check_keywords)
-            print("check_each_keyword: ", check_each_keyword)
+            print("check_start: ", check_start)
+            print("check_end: ", check_end)
 
-        return check_all_keys and check_description and check_keywords, check_each_keyword
+        return check_all_keys and check_description and check_keywords and check_start and check_end
 
 
 def json_corrector(json_str,
@@ -258,15 +370,18 @@ def json_corrector(json_str,
 
     except Exception as e:
         return None
+    
+def floatify_start_end_times(output_dict_list):
+    for d in output_dict_list:
+        d['start'] = float(d['start'])
+        d['end'] = float(d['end'])
+    return output_dict_list
 
 
 def fetch_broll_description(wordlevel_info,
-                            context_start_s,
-                            context_end_s,
-                            context_buffer_s,
+                            num_vids,
                             url,
                             openaiapi_key,
-                            n_searches=3,
                             debug=False):
 
     success = False
@@ -281,33 +396,29 @@ def fetch_broll_description(wordlevel_info,
         "content-type": "application/json",
         "Authorization": "Bearer {}".format(openaiapi_key)}
 
-    transcript = convert_to_text(wordlevel_info)
-    context = give_context(wordlevel_info, context_start_s,
-                           context_end_s, context_buffer_s)
+    chunklevelinfo = chunk_level_transcript(wordlevel_info, chunk_size_s=5)
+    subtitles = convert_to_srt(chunklevelinfo)
 
-    prompt_prefix = """Complete Transcript:
-    {}
-    ----
-    Text of Interest:
-    {}
-    ----
+    prompt_prefix = """{}
     
-    Given the Complete Transcript of a video, generate very relevant stock video description and search phraase to insert as B-roll video.
-    The description of B-roll video should be very relevant to the Text of Interest that is provided.
-    The description should represent the context of the whole video and should represent the Text of Interest.
+    Given the subtitles of a video, generate very relevant stock video descriptions and search phrase to insert as B-roll video.
+    The start and end timestamps of the B-roll videos should perfectly match with the content that is spoken at that time.
+    Strictly don't include any exact word or text labels to be depicted in the videos.
     The description should be one sentence long and should be simple and easy to understand.
     The description should represent the caption of the B-roll video and should be simple.
-    All of search_phrases should be very relevant to the description and should be very relevant to the Text of Interest.
-    The search_phrases should be 1-4 words long each.
-    The number of search_phrases should be {}.
-    Strictly output only JSON in the output using the format (BE CAREFUL NOT TO MISS ANY COMMAS, QUOTES OR SEMICOLONS ETC)-""".format(transcript,
-                                                                                                                                      context,
-                                                                                                                                      n_searches)
+    All of search_phrase should be very relevant to the description and should be very relevant to the Text of Interest.
+    The search_phrase should be 1-4 words long.
+    the search_phrase should be a string.
+    Don't make the timestamps of different videos overlap.
+    Leave enough time gap between different B-Roll video appearances so that the original footage is also played as necessary.
+    Strictly output only JSON in the output using the format (BE CAREFUL NOT TO MISS ANY COMMAS, QUOTES OR SEMICOLONS ETC)-""".format(subtitles)
 
-    sample = {"description": "...", "search_phrases": ["...", "...", "..."]}
-
+    sample = [
+        {"description": "...", "search_phrase": "...", "start": "...", "end": "..."},
+        {"description": "...", "search_phrase": "...", "start": "...", "end": "..."}
+    ]
     prompt = prompt_prefix + json.dumps(sample) + f"""\n
-    Be sure to only make 1 json. \nJSON:"""
+    Be sure to only make {num_vids} jsons. \nJSON:"""
 
     # Define the payload for the chat model
     messages = [
@@ -341,9 +452,10 @@ def fetch_broll_description(wordlevel_info,
             continue
         # Extract data from the API's response
         try:
-            output_ = json.loads(
+            output = json.loads(
                 response_json['choices'][0]['message']['content'].strip())
-            output = [output_]
+            output = floatify_start_end_times(output)
+
             if debug:
                 print("output: ", output)
             success = validate_KV_pair(output, debug=debug)
@@ -361,7 +473,7 @@ def fetch_broll_description(wordlevel_info,
             output = json_corrector(response_json['choices'][0]['message']['content'].strip(),
                                     str(e),
                                     openaiapi_key)
-            if output is not None:
+            if output is not None and validate_KV_pair(output, debug=debug):
                 print("Corrected JSON: ", output)
                 success = True
             else:
@@ -375,9 +487,9 @@ def fetch_broll_description(wordlevel_info,
 
 # %%
 
-
 class NumpyEncoder(json.JSONEncoder):
     """ Special json encoder for numpy types """
+
     def default(self, obj):
         if isinstance(obj, np.integer):
             return int(obj)
@@ -397,60 +509,56 @@ class NumpyEncoder(json.JSONEncoder):
 
 
 def pipeline(word_level_transcript,
-             context_start_s,
-             context_end_s,
-             context_buffer_s,
-             n_seach_phrases,
-             n_searches_per_phrase,
-             top_K,
+             n_vids_hint,
+             n_searches_per_broll=3,
              openaiapi_key=os.getenv("OPENAI_API_KEY"),
              debug=False
              ):
     try:
-        if top_K > n_searches_per_phrase*n_seach_phrases:
-            top_K = n_searches_per_phrase*n_seach_phrases
-            print("Top_K is greater than the total number of videos that can be downloaded. Setting top_K to the maximum number of videos that can be downloaded.")
         # Fetch B-roll descriptions
         broll_descriptions, err_msg = fetch_broll_description(word_level_transcript,
-                                                              context_start_s,
-                                                              context_end_s,
-                                                              context_buffer_s,
-                                                              chatgpt_url,
-                                                              openaiapi_key,
-                                                              n_searches=n_seach_phrases,
+                                                              num_vids=n_vids_hint,
+                                                              url=chatgpt_url,
+                                                              openaiapi_key=openaiapi_key,
                                                               debug=debug)
         if debug:
             print("B-roll descriptions: ", broll_descriptions)
         if err_msg != "" and broll_descriptions is None:
             return err_msg
 
+        video_informations = []
+
         # Download videos from Pexels
+        for broll_description in broll_descriptions:
+            video_dict, err_msg = download_pexels_video([broll_description['search_phrase']],
+                                                        a_roll_start_s=broll_description['start'],
+                                                        a_roll_end_s=broll_description['end'],
+                                                        n_searches_per_phrase=n_searches_per_broll,
+                                                        debug=debug)
+            if debug:
+                print("Video dict: ", video_dict)
+                if err_msg != "":
+                    print("Error message: ", err_msg)
+            if err_msg != "" and video_dict is None:
+                return err_msg
 
-        video_dict, err_msg = download_pexels_video(broll_descriptions[0]['search_phrases'],
-                                                    n_searches_per_phrase=n_searches_per_phrase,
-                                                    debug=debug)
-        if debug:
-            print("Video dict: ", video_dict)
-            if err_msg != "":
-                print("Error message: ", err_msg)
-        if err_msg != "" and video_dict is None:
-            return err_msg
-
-        # Rank videos based on the description
-        ranked_videos = rank_videos(video_dict,
-                                    broll_descriptions[0]['description'],
-                                    top_K=top_K)
+            # Rank videos based on the description
+            ranked_video = rank_videos(video_dict,
+                                       broll_descriptions[0]['description'],
+                                       top_K=1)
+            video_informations.append(ranked_video[0])
 
         # ranked_videos.append({"B-roll description": broll_descriptions[0]['description'],
         #                       "Search Phrases": broll_descriptions[0]['search_phrases']})
 
-        return json.loads(json.dumps(ranked_videos, 
-                                     cls= NumpyEncoder) 
+        return json.loads(json.dumps(video_informations,
+                                     cls=NumpyEncoder)
                           )
     except Exception as e:
         err_msg = "Error in pipeline: " + str(e) + "\n" + tb.format_exc()
         print(err_msg)
         return err_msg
+
 
 # %%
 if __name__ == "__main__":
@@ -462,12 +570,8 @@ if __name__ == "__main__":
     import time
     t0 = time.time()
     img_info = pipeline(example_transcript,
-                        context_start_s=context_start_s,
-                        context_end_s=context_end_s,
-                        context_buffer_s=context_buffer_s,
-                        n_seach_phrases=1,
-                        n_searches_per_phrase=2,
-                        top_K=2,
+                        n_vids_hint=6,
+                        n_searches_per_broll=2,
                         openaiapi_key=OPENAI_API_KEY,
                         debug=True)
     t1 = time.time()
